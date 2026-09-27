@@ -1,139 +1,151 @@
-import csv
+import pdfplumber
 import sys
+import csv
 import re
 from datetime import datetime
 
-try:
-    import pypdf
-except ImportError:
-    print("Error: The 'pypdf' library is required. Install it using: pip install pypdf")
-    sys.exit(1)
-
-def extract_text_from_pdf(pdf_path):
-    """Extracts text from a given PDF file."""
-    reader = pypdf.PdfReader(pdf_path)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
-
-def parse_paystub(text):
-    """
-    Parses the extracted PDF text to locate the Pay Date and YTD values 
-    for Earnings, Deductions, and Taxes.
-    """
+def extract_paystub_data(pdf_path):
     data = {'Earnings': {}, 'Deductions': {}, 'Taxes': {}}
+    pay_date = "01/01/1970"
     
-    # Extract the Pay Date
-    date_match = re.search(r'Pay Date[\s\|]*(\d{2}/\d{2}/\d{4})', text)
-    pay_date = date_match.group(1) if date_match else "01/01/1970"
-    
-    current_section = None
-    lines = text.split('\n')
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Identify the current section of the paystub
-        if 'Earnings' in line and 'Pay Type' not in line:
-            current_section = 'Earnings'
-            continue
-        elif 'Deductions' in line and 'Deduction' not in line:
-            current_section = 'Deductions'
-            continue
-        elif 'Taxes' in line and 'Tax' not in line and 'Taxable Wages' not in line:
-            current_section = 'Taxes'
-            continue
-        elif 'Paid Time Off' in line or 'Pay Summary' in line:
-            current_section = None
-            
-        if not current_section:
-            continue
-            
-        # Match line items by capturing the name and looking for monetary amounts
-        name_match = re.match(r'^([A-Za-z0-9 \-]+?)(?:\s*\||\s{2,}|\s+\d)', line)
-        if name_match:
-            item_name = name_match.group(1).strip()
-            
-            # Filter out header rows that might get accidentally matched
-            if item_name.lower() in ['pay type', 'deduction', 'tax', 'total hours', 'total', 'based on']:
-                continue
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            # Extract Pay Date from the page text
+            text = page.extract_text()
+            date_match = re.search(r'Pay Date[\s\|]*(\d{2}/\d{2}/\d{4})', text)
+            if date_match:
+                pay_date = date_match.group(1)
                 
-            # Extract all currency values on the line (e.g., $1,234.56 or 1,234.56$)
-            amounts = re.findall(r'[\$]?\s*([0-9,]+\.\d{2})\s*[\$]?', line)
+            # Extract spatial words to map the 2D layout
+            words = page.extract_words(keep_blank_chars=True)
             
-            if amounts:
-                if current_section == 'Deductions' and len(amounts) >= 2:
-                    # PDF extraction sometimes swaps "Employee Current" and "Employee YTD" order.
-                    # Because YTD >= Current, the maximum of the first two amounts is the YTD value.
-                    val1 = float(amounts[0].replace(',', ''))
-                    val2 = float(amounts[1].replace(',', ''))
-                    ytd_float = max(val1, val2)
-                else:
-                    # For Earnings and Taxes, the YTD value is reliably the final amount on the line.
-                    ytd_float = float(amounts[-1].replace(',', ''))
+            # Identify the Y-coordinates for the start of each section
+            earnings_top = None
+            deductions_top = None
+            taxes_top = None
+            
+            for w in words:
+                t = w['text'].lower()
+                if t == 'earnings' and earnings_top is None:
+                    earnings_top = w['top']
+                elif t == 'deductions' and deductions_top is None:
+                    deductions_top = w['top']
+                elif t == 'taxes' and taxes_top is None:
+                    taxes_top = w['top']
                     
-                data[current_section][item_name] = ytd_float
+            if earnings_top is None:
+                continue  # Skip pages without paystub tables
+                
+            taxes_top = taxes_top or page.height
+            center_x = page.width / 2
+            
+            # Find the bottom boundary to exclude Paid Time Off and Pay Summary
+            cutoff_top = page.height
+            for w in words:
+                t = w['text'].lower()
+                if t in ['paid time off', 'pay summary'] and w['top'] < cutoff_top:
+                    cutoff_top = w['top']
+            
+            # Route words into their respective tables based on X/Y coordinates
+            earnings_words = []
+            deductions_words = []
+            taxes_words = []
+            
+            for w in words:
+                if w['top'] <= max(earnings_top, deductions_top) + 15:
+                    continue  # Ignore main headers
+                    
+                if w['top'] < taxes_top - 10:
+                    if w['x0'] < center_x:
+                        earnings_words.append(w)
+                    else:
+                        deductions_words.append(w)
+                elif taxes_top + 10 <= w['top'] < cutoff_top - 5:
+                    taxes_words.append(w)
+                    
+            def parse_section(section_words, section_name):
+                # Group words into horizontal lines (using a 3-point vertical bucket)
+                lines = {}
+                for w in section_words:
+                    line_y = round(w['top'] / 3) * 3
+                    if line_y not in lines:
+                        lines[line_y] = []
+                    lines[line_y].append(w)
+                    
+                for line_y in sorted(lines.keys()):
+                    line_words = sorted(lines[line_y], key=lambda w: w['x0'])
+                    line_text = " ".join([w['text'] for w in line_words])
+                    
+                    # Capture everything before the first number or dollar sign
+                    name_match = re.match(r'^([^0-9\$]+)', line_text)
+                    if not name_match:
+                        continue
+                        
+                    name = name_match.group(1).replace('|', '').strip()
+                    if name.lower() in ['pay type', 'deduction', 'tax', 'total hours', 'total hours worked']:
+                        continue
+                        
+                    # Extract all currency amounts strictly ending with 2 decimal places
+                    # This safely ignores 4-decimal pay rates and 6-decimal hours
+                    amounts = re.findall(r'(-?[0-9,]+\.\d{2})(?!\d)', line_text)
+                    
+                    if amounts:
+                        if section_name == 'Deductions' and len(amounts) >= 2:
+                            # Left-to-right deductions format: Emp Current, Emp YTD, ER Current, ER YTD
+                            ytd = float(amounts[1].replace(',', ''))
+                        else:
+                            # Earnings & Taxes consistently have YTD as the final column
+                            ytd = float(amounts[-1].replace(',', ''))
+                            
+                        data[section_name][name] = ytd
 
+            parse_section(earnings_words, 'Earnings')
+            parse_section(deductions_words, 'Deductions')
+            parse_section(taxes_words, 'Taxes')
+            
     return pay_date, data
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python script.py <new_paystub.pdf> [old_paystub.pdf]")
+        print("Usage: python parse_paystubs.py <new_paystub.pdf> [old_paystub.pdf]")
         sys.exit(1)
         
     new_pdf = sys.argv[1]
     old_pdf = sys.argv[2] if len(sys.argv) > 2 else None
     
-    # Parse the current month's paystub
-    new_text = extract_text_from_pdf(new_pdf)
-    new_date, new_data = parse_paystub(new_text)
+    new_date, new_data = extract_paystub_data(new_pdf)
     
-    # Determine if it is a January paystub
     is_january = False
     try:
-        date_obj = datetime.strptime(new_date, "%m/%d/%Y")
-        if date_obj.month == 1:
+        if datetime.strptime(new_date, "%m/%d/%Y").month == 1:
             is_january = True
     except ValueError:
         pass
         
-    # Parse the previous month's paystub if it is not January
     old_data = {'Earnings': {}, 'Deductions': {}, 'Taxes': {}}
     if not is_january and old_pdf:
-        old_text = extract_text_from_pdf(old_pdf)
-        _, old_data = parse_paystub(old_text)
+        _, old_data = extract_paystub_data(old_pdf)
         
-    # Generate the CSV output to stdout
     writer = csv.writer(sys.stdout)
     writer.writerow(["Date", "Description", "Amount"])
     
     for category in ['Earnings', 'Deductions', 'Taxes']:
-        # Combine unique line items from both paystubs to catch new or dropped items
         all_items = set(new_data[category].keys()).union(set(old_data[category].keys()))
-        
         for item in sorted(all_items):
             new_ytd = new_data[category].get(item, 0.0)
             old_ytd = old_data[category].get(item, 0.0)
             
-            # Calculate the delta based on whether it is the start of the year
-            if is_january:
-                delta = new_ytd
-            else:
-                delta = new_ytd - old_ytd
-                
-            # Exclude items with zero activity for the month
-            if delta == 0:
+            delta = new_ytd if is_january else new_ytd - old_ytd
+            
+            # Exclude items with $0.00 delta for the month
+            if abs(delta) < 0.01:
                 continue
                 
-            # Apply appropriate negative/positive signs based on the category
+            # Report taxes and deductions as negative sums
             if category in ['Deductions', 'Taxes']:
                 delta = -delta
                 
-            description = f"{category}: {item}"
-            writer.writerow([new_date, description, f"{delta:.2f}"])
+            writer.writerow([new_date, f"{category}: {item}", f"{delta:.2f}"])
 
 if __name__ == '__main__':
     main()
