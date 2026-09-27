@@ -3,7 +3,6 @@ import sys
 import csv
 import re
 from datetime import datetime
-import unicodedata
 
 def extract_paystub_data(pdf_path):
     data = {'Earnings': {}, 'Deductions': {}, 'Taxes': {}}
@@ -11,91 +10,110 @@ def extract_paystub_data(pdf_path):
     
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            # Extract standard text to reliably find the Pay Date
             text_std = page.extract_text()
             if not text_std:
                 continue
+                
+            # Extract standard text to reliably find the Pay Date
             date_match = re.search(r'Pay Date[\s\|]*(\d{2}/\d{2}/\d{4})', text_std)
             if date_match:
                 pay_date = date_match.group(1)
                 
-            # Extract layout text: preserves physical gaps by padding with spaces
-            layout_text = page.extract_text(layout=True)
-            if not layout_text:
+            words = page.extract_words()
+            if not words:
                 continue
                 
-            lines = layout_text.split('\n')
-            max_len = max((len(l) for l in lines), default=0)
+            # Locate the X, Y coordinates of the table headers to define our crop boundaries
+            e_top, d_top, d_x0, t_top = None, None, None, None
             
-            # Start in the top half (Earnings left, Deductions right)
-            mode = 'top' 
-            
-            for line in lines:
-                stripped_lower = line.strip().lower().replace(' ', '')
-                if stripped_lower == 'taxes':
-                    mode = 'taxes'
-                elif stripped_lower in ['paidtimeoff', 'paysummary']:
-                    mode = 'done'
+            for w in words:
+                t = w['text'].lower()
+                if t == 'earnings' and e_top is None and w['top'] < page.height * 0.5:
+                    e_top = w['top']
+                if t == 'deductions' and d_top is None and w['top'] < page.height * 0.5:
+                    d_top = w['top']
+                    d_x0 = w['x0']  # The exact X-coordinate where the Deductions table begins
+                if t == 'taxes' and t_top is None and w['top'] > page.height * 0.3:
+                    t_top = w['top']
                     
-                if mode == 'done':
-                    break
-                    
-                if mode == 'top':
-                    # Pad line to max width and slice exactly down the middle gap
-                    padded_line = line.ljust(max_len)
-                    mid = max_len // 2
-                    left_part = padded_line[:mid]
-                    right_part = padded_line[mid:]
-                    
-                    parse_line(left_part, 'Earnings', data)
-                    parse_line(right_part, 'Deductions', data)
-                    
-                elif mode == 'taxes':
-                    parse_line(line, 'Taxes', data)
-                    
-    return pay_date, data
+            # Locate the Y-coordinate of the bottom cutoff (to exclude Paid Time Off)
+            cutoff_top = page.height
+            for i, w in enumerate(words):
+                t = w['text'].lower()
+                if t == 'paid' and i + 1 < len(words) and 'time' in words[i+1]['text'].lower():
+                    if t_top is None or w['top'] > t_top:
+                        cutoff_top = min(cutoff_top, w['top'])
+                if t == 'pay' and i + 1 < len(words) and 'summary' in words[i+1]['text'].lower():
+                    if t_top is None or w['top'] > t_top:
+                        cutoff_top = min(cutoff_top, w['top'])
 
-def parse_line(text, section, data):
-    text = text.strip()
-    if not text: return
-    
-    # Extract all numbers that follow monetary or hours formats
-    amounts = re.findall(r'-?\$?[0-9,]+\.\d{2,6}', text)
-    if not amounts: return
-    
-    # The name is defined as everything up to the first amount
-    first_amt = amounts[0]
-    idx = text.find(first_amt)
-    if idx <= 0: return
-    
-    name = text[:idx].strip()
-    
-    # Filter out table headers and summary totals
-    skip = ['pay type', 'deduction', 'tax', 'total', 'total hours', 'total hours worked', 
-            'current', 'ytd', 'gross', 'net pay', 'plan', 'vacation', 'based on', 'balance']
-    if not name or name.lower() in skip or name.lower().startswith('total'):
-        return
-        
-    try:
-        # Determine the YTD amount
-        if section == 'Deductions' and len(amounts) >= 2:
-            # For deductions, Employee YTD is always the second monetary column
-            ytd_str = amounts[1]
-        else:
-            # For Earnings and Taxes, YTD is always the final column
-            ytd_str = amounts[-1]
+            # Apply defaults if any headers were missing on the page
+            e_top = e_top if e_top is not None else 0
+            d_top = d_top if d_top is not None else 0
+            d_x0 = d_x0 if d_x0 is not None else (page.width / 2)
+            t_top = t_top if t_top is not None else cutoff_top
             
-        ytd = float(re.sub(r'[^\d\.\-]', '', ytd_str))
-        
-        # Aggressive normalization for dictionary keys to combat PDF spacing/OCR changes
-        key = name.replace('Ε', 'E').replace('ε', 'e') # Catch Greek Epsilons
-        key = unicodedata.normalize('NFKD', key).encode('ASCII', 'ignore').decode('utf-8')
-        key = re.sub(r'[^a-z0-9]', '', key.lower())
-        
-        # Save both the clean YTD float and the original display name
-        data[section][key] = {'name': name, 'ytd': ytd}
-    except Exception:
-        pass
+            e_bottom = min(t_top, cutoff_top)
+            d_bottom = min(t_top, cutoff_top)
+            t_bottom = cutoff_top
+            
+            # Helper to crop the page and extract text only within that physical box
+            def get_bbox_text(x0, top, x1, bottom):
+                if top >= bottom or x0 >= x1:
+                    return ""
+                try:
+                    return page.within_bbox((x0, top, x1, bottom)).extract_text(layout=True)
+                except Exception:
+                    return ""
+
+            # Mathematically isolate the 3 sections to prevent column-bleeding
+            e_text = get_bbox_text(0, e_top, d_x0 - 5, e_bottom)
+            d_text = get_bbox_text(d_x0 - 5, d_top, page.width, d_bottom)
+            t_text = get_bbox_text(0, t_top, page.width, t_bottom) if t_top < cutoff_top else ""
+            
+            def parse_section(text, section_name):
+                if not text: return
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # Match all monetary amounts/hours that include decimals
+                    matches = list(re.finditer(r'[-\$]{0,2}[0-9,]+\.\d+', line))
+                    if not matches:
+                        continue
+                        
+                    first_match_start = matches[0].start()
+                    name = line[:first_match_start].strip()
+                    
+                    # Strip all spaces and punctuation from the name so it strictly matches across months
+                    name_clean = re.sub(r'[^a-z0-9]', '', name.lower())
+                    
+                    skip = ['paytype', 'deduction', 'tax', 'total', 'totalhours', 'totalhoursworked', 
+                            'current', 'ytd', 'gross', 'netpay', 'plan', 'vacation', 'basedon', 'balance', 
+                            'employeecurrent', 'employercurrent', 'employeeytd', 'employerytd']
+                            
+                    if not name_clean or name_clean in skip or name.lower().startswith('total'):
+                        continue
+                        
+                    amounts_str = [m.group() for m in matches]
+                    amounts = [float(re.sub(r'[^\d\.\-]', '', a)) for a in amounts_str]
+                    
+                    try:
+                        # Grab appropriate YTD amount based on table structure
+                        if section_name == 'Deductions' and len(amounts) >= 2:
+                            ytd = amounts[1]
+                        else:
+                            ytd = amounts[-1]
+                            
+                        data[section_name][name_clean] = {'name': name, 'ytd': ytd}
+                    except IndexError:
+                        pass
+
+            parse_section(e_text, 'Earnings')
+            parse_section(d_text, 'Deductions')
+            parse_section(t_text, 'Taxes')
+            
+    return pay_date, data
 
 def main():
     if len(sys.argv) < 2:
@@ -124,7 +142,7 @@ def main():
     for category in ['Earnings', 'Deductions', 'Taxes']:
         all_keys = set(new_data[category].keys()).union(set(old_data[category].keys()))
         
-        # Retrieve the original display name, prioritizing the newer paystub's formatting
+        # Display the line item name using the newest paystub's formatting
         def get_name(k):
             if k in new_data[category]: return new_data[category][k]['name']
             return old_data[category][k]['name']
@@ -136,11 +154,11 @@ def main():
             
             delta = new_ytd if is_january else new_ytd - old_ytd
             
-            # Skip line items with zero net change for the month
+            # Skip rows with no monthly activity
             if abs(delta) < 0.01:
                 continue
                 
-            # Output Deductions and Taxes as negative sums
+            # Flip signs for debits
             if category in ['Deductions', 'Taxes']:
                 delta = -delta
                 
