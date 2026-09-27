@@ -117,11 +117,15 @@ def extract_paystub_data(pdf_path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python parse_paystubs.py <new_paystub.pdf> [old_paystub.pdf]")
+        print("Usage: python paystub2csv.py [old_paystub.pdf] <new_paystub.pdf>")
         sys.exit(1)
         
-    new_pdf = sys.argv[1]
-    old_pdf = sys.argv[2] if len(sys.argv) > 2 else None
+    if len(sys.argv) == 2:
+        old_pdf = None
+        new_pdf = sys.argv[1]
+    else:
+        old_pdf = sys.argv[1]
+        new_pdf = sys.argv[2]
     
     new_date, new_data = extract_paystub_data(new_pdf)
     
